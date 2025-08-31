@@ -1,2 +1,3 @@
 imagenet1k/
 venv/
+*.pth
