@@ -6,7 +6,6 @@ from typing import Tuple
 
 import torch
 import torch.optim as optim
-import torch.backends.cudnn as cudnn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader, Dataset
@@ -210,7 +209,7 @@ def create_dataloaders_from_parquet(image_size: int, batch_size: int, data_dir: 
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=12,
+        num_workers=8,
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=4
