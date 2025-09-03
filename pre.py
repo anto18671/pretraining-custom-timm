@@ -213,6 +213,7 @@ def create_dataloaders_from_parquet(image_size: int, batch_size: int, data_dir: 
         num_workers=12,
         drop_last=True,
         persistent_workers=True,
+        prefetch_factor=4
     )
 
     val_loader = DataLoader(
@@ -222,6 +223,7 @@ def create_dataloaders_from_parquet(image_size: int, batch_size: int, data_dir: 
         num_workers=2,
         drop_last=True,
         persistent_workers=True,
+        prefetch_factor=4
     )
 
     return train_loader, val_loader, class_to_idx
@@ -316,7 +318,7 @@ def build_warmup_cosine_scheduler(optimizer: optim.Optimizer, warmup_epochs: int
 # ---------------------------
 # Train for one epoch with AMP and EMA
 # ---------------------------
-def train_one_epoch(model, ema_model, loader, train_criterion, optimizer, scheduler, device, scaler, mixup_fn, epoch, epochs, steps_done):
+def train_one_epoch(model, ema_model, loader, train_criterion, optimizer, scheduler, device, scaler, mixup_fn, epoch, epochs, steps_done, accumulation_steps):
     # Set model to training mode
     model.train()
 
@@ -324,6 +326,9 @@ def train_one_epoch(model, ema_model, loader, train_criterion, optimizer, schedu
     running_loss = 0.0
     running_correct = 0
     running_count = 0
+
+    # Initialize accumulation counter
+    micro_step = 0
 
     # Create tqdm loop
     loop = tqdm(loader, desc=f"Train Epoch {epoch}/{epochs}", leave=False)
@@ -337,34 +342,44 @@ def train_one_epoch(model, ema_model, loader, train_criterion, optimizer, schedu
         # Apply mixup augmentation
         images, targets = mixup_fn(images, targets)
 
-        # Reset optimizer gradients
-        optimizer.zero_grad(set_to_none=True)
+        # Reset optimizer gradients at the start of an accumulation cycle
+        if micro_step % accumulation_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
 
         # Forward pass with AMP
         with torch.amp.autocast('cuda'):
             outputs = model(images)
-            loss = train_criterion(outputs, targets)
+            full_loss = train_criterion(outputs, targets)
+
+        # Scale loss by accumulation steps
+        loss = full_loss / accumulation_steps
 
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
 
-        # Update EMA parameters
-        ema_model.update_parameters(model)
+        # Perform optimizer step at accumulation boundary
+        if (micro_step + 1) % accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
-        # Step learning rate scheduler
-        scheduler.step()
-        steps_done += 1
+            # Update EMA parameters after optimizer step
+            ema_model.update_parameters(model)
+
+            # Step learning rate scheduler once per optimizer update
+            scheduler.step()
+            steps_done += 1
+
+            # Reset gradients for next cycle
+            optimizer.zero_grad(set_to_none=True)
 
         # Compute predictions and hard targets
         preds = outputs.float().softmax(dim=1).argmax(dim=1)
         hard_targets = targets.float().argmax(dim=1)
 
-        # Update statistics
-        running_loss += loss.item() * images.size(0)
+        # Update statistics using unscaled loss
+        running_loss += full_loss.item() * images.size(0)
         running_correct += (preds == hard_targets).sum().item()
         running_count += images.size(0)
 
@@ -374,6 +389,9 @@ def train_one_epoch(model, ema_model, loader, train_criterion, optimizer, schedu
 
         # Update tqdm display
         loop.set_postfix(loss=avg_loss, acc=avg_acc)
+
+        # Increment micro step
+        micro_step += 1
 
     # Final averages
     epoch_loss = running_loss / max(1, running_count)
@@ -435,8 +453,11 @@ def evaluate(model, loader, eval_criterion, device, epoch, epochs):
 # Training orchestration with EMA and Hub auto-download
 # ---------------------------
 def main():
-    # Enable cuDNN benchmark mode for speed
-    cudnn.benchmark = True
+    # Enable cudnn optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     # Define dataset repository information
     repo_id = os.environ.get("HF_IMAGENET_REPO", "benjamin-paine/imagenet-1k-256x256")
@@ -450,7 +471,7 @@ def main():
 
     # Define training hyperparameters
     image_size = 256
-    batch_size = 128
+    batch_size = 32
     epochs = 100
     warmup_epochs = 6
     base_lr = 5e-4 * (batch_size / 512.0)
@@ -458,6 +479,9 @@ def main():
     mixup_alpha = 0.8
     cutmix_alpha = 1.0
     ema_decay = 0.9999
+
+    # Define gradient accumulation steps
+    accumulation_steps = 8
 
     # Ensure parquet dataset is available locally
     try:
@@ -504,8 +528,10 @@ def main():
     # Print model summary
     torchsummary.summary(model, (3, image_size, image_size))
 
+    # Compute effective optimizer steps per epoch
+    steps_per_epoch = math.ceil(len(train_loader) / max(1, accumulation_steps))
+
     # Build learning rate scheduler
-    steps_per_epoch = len(train_loader)
     scheduler = build_warmup_cosine_scheduler(
         optimizer,
         warmup_epochs=warmup_epochs,
@@ -533,7 +559,8 @@ def main():
             mixup_fn=mixup_fn,
             epoch=epoch,
             epochs=epochs,
-            steps_done=global_steps
+            steps_done=global_steps,
+            accumulation_steps=accumulation_steps
         )
 
         # Evaluate base model
